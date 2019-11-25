@@ -13,3 +13,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 io.datajuice.nifi.processors.dbroutecall.GetRetryRoute
+io.datajuice.nifi.processors.dbroutecall.StoreDLQAttributes

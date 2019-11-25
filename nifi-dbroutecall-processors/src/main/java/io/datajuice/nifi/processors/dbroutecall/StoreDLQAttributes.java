@@ -16,6 +16,8 @@
  */
 package io.datajuice.nifi.processors.dbroutecall;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.nifi.annotation.behavior.ReadsAttribute;
 import org.apache.nifi.annotation.behavior.ReadsAttributes;
 import org.apache.nifi.annotation.behavior.WritesAttribute;
@@ -29,6 +31,7 @@ import org.apache.nifi.dbcp.DBCPService;
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.processor.*;
 import org.apache.nifi.processor.exception.ProcessException;
+import sun.security.krb5.internal.APRep;
 
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -47,7 +50,7 @@ import static io.datajuice.nifi.processors.dbroutecall.Relationships.REL_SUCCESS
 @SeeAlso({})
 @ReadsAttributes({@ReadsAttribute(attribute="", description="")})
 @WritesAttributes({@WritesAttribute(attribute="", description="")})
-public class GetRetryRoute extends AbstractProcessor {
+public class StoreDLQAttributes extends AbstractProcessor {
 
     private List<PropertyDescriptor> descriptors;
 
@@ -62,7 +65,6 @@ public class GetRetryRoute extends AbstractProcessor {
         descriptors.add(DBCP_SERVICE);
         descriptors.add(PROCESS_GROUP);
         descriptors.add(PROCESSOR);
-        descriptors.add(ATTEMPT_NUM);
         this.descriptors = Collections.unmodifiableList(descriptors);
 
         final Set<Relationship> relationships = new HashSet<Relationship>();
@@ -84,6 +86,7 @@ public class GetRetryRoute extends AbstractProcessor {
     @OnScheduled
     public void setup(ProcessContext context) {
         dbcpService = context.getProperty(DBCP_SERVICE).asControllerService(DBCPService.class);
+
     }
 
     @Override
@@ -93,43 +96,36 @@ public class GetRetryRoute extends AbstractProcessor {
             return;
         }
 
+        final String preInsertSQL=
+                " INSERT INTO dlq(ff_uuid, processor_group, processor, attributes)" +
+                " VALUES(''{0}'', ''{1}'', ''{2}'', ''{3}'')";
+
+        final Map<String, String> attributes = flowFile.getAttributes();
         final String processor = context.getProperty(PROCESSOR).evaluateAttributeExpressions(flowFile).getValue();
         final String processGroup = context.getProperty(PROCESS_GROUP).evaluateAttributeExpressions(flowFile).getValue();
-        final String attempt = context.getProperty(ATTEMPT_NUM).evaluateAttributeExpressions(flowFile).getValue();
+        final String uuid = flowFile.getAttribute("uuid");
 
-        final String PRE_SELECT_QUERY =
-                "select a.route " +
-                "FROM error_retry_framework a " +
-                "JOIN " +
-                "   (SELECT " +
-                "       route," +
-                "       max(attempt) max_attempt " +
-                "   FROM error_retry_framework " +
-                "   where lower(process_group) = ''{0}'' " +
-                "   and lower(processor) = ''{1}'' " +
-                "   and attempt <= {2} " +
-                "   GROUP BY route) x " +
-                "ON a.route = x.route " +
-                "AND a.attempt = x.max_attempt";
-        final String selectQuery = MessageFormat.format(PRE_SELECT_QUERY, processGroup.toLowerCase(),
-                processor.toLowerCase(), attempt);
 
+
+        ObjectMapper objectMapper = new ObjectMapper();
+        String json;
+        try {
+            json = objectMapper.writeValueAsString(attributes);
+        } catch (JsonProcessingException e) {
+            throw new ProcessException("Failed to dump attributes to JSON string");
+        }
+
+        final String insertSQL = MessageFormat.format(preInsertSQL, uuid, processGroup, processor, json);
 
         try (final Connection con = dbcpService.getConnection();
-             final PreparedStatement st = con.prepareStatement(selectQuery)) {
-            boolean hasResults = st.execute();
+             final PreparedStatement st = con.prepareStatement(insertSQL)) {
+            st.execute();
 
-            if (hasResults) {
-                final ResultSet resultSet = st.getResultSet();
-                resultSet.next();
-                String route = resultSet.getString("route");
-
-                session.putAttribute(flowFile, "failureRoute", route);
-
-            } else throw new ProcessException("Result set empty");
-
-
+            // Before we transfer to success, let's set the filename to the UUID. That way, if the filename was the
+            // reason for issue, it doesn't become an issue when sending our file to the DLQ
+            session.putAttribute(flowFile, "filename", uuid);
             session.transfer(flowFile, REL_SUCCESS);
+
         } catch (SQLException | ProcessException e) {
             session.putAttribute(flowFile, "error", e.toString());
             session.transfer(flowFile, REL_FAILURE);
